@@ -103,8 +103,9 @@ all_year_processed <- all_year %>%
 
 ```{r}
 
+#saveRDS( all_year, file = "snps_all_file.rds")
 
-all_year_processed <- all_year 
+all_year_processed <- readRDS(file = "snps_all_file.rds")
 all_year_processed$pNpS_ratio[all_year_processed$pNpS_ratio == "Inf"] <- 99
 all_year_processed$pNpS_ratio <- as.numeric(all_year_processed$pNpS_ratio)
 all_year_processed$num_snps <- as.numeric(all_year_processed$num_snps)
@@ -783,6 +784,17 @@ model <- glmmTMB(
 )
 summary(model)
 
+
+counts_prop <- counts_df %>%
+  mutate(total_selection_genes = positive_gene_count + negative_gene_count,
+         prop_positive = positive_gene_count / total_selection_genes)
+model_balance <- glmmTMB(
+  cbind(positive_gene_count, negative_gene_count) ~ Collection.Year + 
+    (1 | family) + (1 | giantvirus),
+  family = betabinomial,
+  data = counts_df
+)
+summary(model_balance )
 ```
 
 
