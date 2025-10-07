@@ -1,0 +1,1332 @@
+---
+title: "snps_robust_analysis"
+output: html_document
+date: "2025-04-25"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)
+library(data.table)
+library(tidyr)
+library(dplyr)
+library(lubridate)
+library(geomtextpath)
+library(plotly)
+library(ggtree)
+library(ape)
+library(treeio)
+library(tidytree)
+library(tidyverse)
+library(ggnewscale)
+library(ggtreeExtra)
+library(aplot)
+library(tidyverse)
+library(igraph)
+library(ggraph) 
+library(viridis)
+library(cowplot)
+library(tidyverse)
+library(igraph)
+library(ggraph)
+library(gganimate)
+library(RColorBrewer)
+library(data.table)
+library(ggalluvial)
+library(tidygraph)
+library(ComplexHeatmap)
+library(permute)
+library(changepoint)
+library(gridExtra)
+library(DHARMa)
+library(glmmTMB)
+```
+
+## Input files
+
+
+
+```{r }
+gene_micro <- fread("global_95_gene_microdiversity.tsv", sep = "\t")
+gene_micro_2 <- gene_micro %>%
+  mutate_all(~gsub("sorted_", "", ., fixed = TRUE))
+gene_micro2 <- gene_micro_2 %>%
+  mutate_all(~gsub("_mapped", "", ., fixed = TRUE))
+gene_micro2$sampleid <- gene_micro2$source
+gene_micro2$sampleid  <- gsub("_.*", "", gene_micro2$sampleid )
+gene_micro2$giantvirus <- gene_micro2$contig
+gene_micro2$giantvirus <- gsub("^(bin_[0-9]+).*", "\\1", gene_micro2$giantvirus )
+gene_micro2$sampleid  <- as.numeric(gene_micro2$sampleid)
+gene_micro3 <- left_join(gene_micro2, collection_df, by = c("sampleid"="Sequencing.Project.ID"))
+gene_micro4 <- drop_na(gene_micro3)
+gene_micro5<- gene_micro4 %>%
+  mutate_all(~gsub("|", "_", ., fixed = TRUE))
+all_emapper <- fread("R_studio/all_gene_data/emapper_out.emapper.annotations", sep = "\t")
+species <- fread("R_studio/species_final.csv")
+all_pfam <- fread("R_studio/all_gene_data/pfam.annotations", sep = " ")
+
+temp <- left_join(gene_micro5, all_emapper, by = c("contig_gene"="V1"))
+temp2 <- left_join(temp, species, by = c("giantvirus" = "query"))
+all_year <- temp2
+all_year$Label <- factor(all_year$Label, 
+                         levels = c("Ice-on", "Spring", "Clearwater",
+                                    "Early.Summer", "Late.Summer","Fall"))
+
+
+all_year$selection <- "Negative/Neutral"
+all_year$selection[all_year$pNpS_ratio > 1] <- "Positive"
+#all_year_e <- all_year[all_year$family != "f_",]
+all_year$family <- gsub("f_*", "", all_year$family )
+all_year_temp <- all_year[all_year$snps_present == "TRUE",]
+all_year$infection_status <- "Pre-Invasion (2009 and Earlier)"
+all_year$infection_status[all_year_temp$Collection.Year >= 2010   ] <- "Post-SWF (2010-2018)"
+
+all_year_processed <- all_year %>%
+  mutate(
+    pNpS_numeric = case_when(
+      is.infinite(pNpS_ratio) ~ 99,
+      TRUE ~ as.numeric(pNpS_ratio)
+    ),
+    selection_category = case_when(
+      is.infinite(pNpS_ratio) ~ "Strong positive (Inf)",
+      pNpS_ratio > 1 ~ "Positive",
+      TRUE ~ "Negative/Neutral"
+    )
+  )
+```
+
+
+
+# Sliding window and changepoint analysis
+### INF coded as 99
+
+
+```{r}
+
+
+all_year_processed <- all_year 
+all_year_processed$pNpS_ratio[all_year_processed$pNpS_ratio == "Inf"] <- 99
+all_year_processed$pNpS_ratio <- as.numeric(all_year_processed$pNpS_ratio)
+all_year_processed$num_snps <- as.numeric(all_year_processed$num_snps)
+
+# Fi# Prepare annual summary statistics
+annual_diversity <- all_year_processed %>%
+  filter(snps_present == "TRUE") %>%
+  group_by(Collection.Year) %>%
+  summarize(
+    mean_pNpS = mean(pNpS_ratio, na.rm = TRUE),
+    median_pNpS = median(pNpS_ratio, na.rm = TRUE),
+    positive_selection_percent = 100 * sum(pNpS_ratio > 1, na.rm = TRUE) / n(),
+    num_genes_with_snps = n_distinct(contig_gene),
+    mean_snp_density = mean(num_snps, na.rm = TRUE),
+    n_samples = n_distinct(sampleid)
+  ) %>%
+  filter(!is.na(Collection.Year), Collection.Year >= 2000, Collection.Year <= 2018)
+
+
+# Apply PELT changepoint detection to mean pN/pS ratio
+cp_pNpS <- cpt.mean(annual_diversity$mean_pNpS, method = "PELT", 
+                    penalty = "BIC", minseglen = 2)
+cp_years_pNpS <- annual_diversity$Collection.Year[cpts(cp_pNpS)]
+
+# Apply PELT to positive selection percentage
+cp_pos_sel <- cpt.mean(annual_diversity$positive_selection_percent, method = "PELT", 
+                       penalty = "BIC", minseglen = 2)
+cp_years_pos_sel <- annual_diversity$Collection.Year[cpts(cp_pos_sel)]
+
+# Apply PELT to SNP density
+cp_snp <- cpt.mean(annual_diversity$mean_snp_density, method = "PELT", 
+                  penalty = "BIC", minseglen = 2)
+cp_years_snp <- annual_diversity$Collection.Year[cpts(cp_snp)]
+
+sliding_window_test <- function(data, start_year=2006, end_year=2012, metric="mean_pNpS") {
+  results <- data.frame(
+    breakpoint_year = start_year:end_year,
+    metric_diff = numeric(end_year - start_year + 1),
+    p_value = numeric(end_year - start_year + 1)
+  )
+  
+  for(i in 1:nrow(results)) {
+    year <- results$breakpoint_year[i]
+    
+    # Create before/after datasets for this breakpoint
+    before_data <- data[data$Collection.Year <= year, ]
+    after_data <- data[data$Collection.Year > year, ]
+    
+    # Skip if not enough data in either period
+    if(nrow(before_data) < 3 || nrow(after_data) < 3) {
+      results$metric_diff[i] <- NA
+      results$p_value[i] <- NA
+      next
+    }
+    
+    # Calculate actual difference between periods
+    before_val <- mean(before_data[[metric]], na.rm = TRUE)
+    after_val <- mean(after_data[[metric]], na.rm = TRUE)
+    diff <- after_val - before_val
+    results$metric_diff[i] <- diff
+    
+    # Permutation test
+    combined <- rbind(before_data, after_data)
+    combined$period <- c(rep("before", nrow(before_data)), rep("after", nrow(after_data)))
+    
+    perm_diffs <- numeric(1000)
+    for(j in 1:1000) {
+      # Randomly reassign periods
+      set.seed(j)
+      combined$rand_period <- sample(combined$period)
+      
+      # FIX: Properly subset data and access the metric column by name
+      rand_before <- combined[combined$rand_period == "before", ]
+      rand_after <- combined[combined$rand_period == "after", ]
+      
+      # Calculate means for the randomly assigned groups
+      perm_before <- mean(rand_before[[metric]], na.rm = TRUE)
+      perm_after <- mean(rand_after[[metric]], na.rm = TRUE)
+      perm_diffs[j] <- perm_after - perm_before
+    }
+    
+    # Two-sided p-value
+    p_val <- sum(abs(perm_diffs) >= abs(diff)) / 1000
+    results$p_value[i] <- p_val
+  }
+  
+  return(results)
+}
+
+# Run sliding window analysis for different metrics
+sw_pNpS <- sliding_window_test(annual_diversity, metric="mean_pNpS")
+sw_pos_sel <- sliding_window_test(annual_diversity, metric="positive_selection_percent")
+sw_snp_density <- sliding_window_test(annual_diversity, metric="mean_snp_density")
+
+# 3. GENE-SPECIFIC ANALYSIS
+# Get top genes showing the largest selection shift
+gene_selection_shift <- all_year_processed %>%
+  filter(snps_present == "TRUE") %>%
+  group_by(contig_gene, infection_status) %>%
+  summarize(mean_pNpS = mean(pNpS_ratio, na.rm = TRUE), 
+            n_samples = n_distinct(sampleid),
+            .groups = "drop") %>%
+  pivot_wider(id_cols = contig_gene, 
+              names_from = infection_status, 
+              values_from = mean_pNpS) %>%
+  mutate(pNpS_shift = `Post-SWF (2010-2018)` - `Pre-Invasion (2009 and Earlier)`) %>%
+  arrange(desc(abs(pNpS_shift))) %>%
+  filter(!is.na(pNpS_shift))
+
+# 4. VISUALIZATION
+
+p1 <- ggplot(annual_diversity, aes(x = Collection.Year, y = mean_pNpS)) +
+  geom_line() +
+  geom_point() +
+  geom_vline(xintercept = 2009, linetype = "dashed", color = "red") +
+  geom_vline(xintercept = cp_years_pNpS, linetype = "dotted", color = "blue") +
+  theme_minimal() +
+  labs(title = "Mean pN/pS Ratio Over Time",
+       subtitle = "Red = Spiny Water Flea Detection (2009), Blue = Change Points",
+       x = "Year", y = "Mean pN/pS Ratio")
+
+p2 <- ggplot(annual_diversity, aes(x = Collection.Year, y = positive_selection_percent)) +
+  geom_line() +
+  geom_point() +
+  geom_vline(xintercept = 2009, linetype = "dashed", color = "red") +
+  geom_vline(xintercept = cp_years_pos_sel, linetype = "dotted", color = "blue") +
+  theme_minimal() +
+  labs(title = "Percentage of Genes Under Positive Selection",
+       x = "Year", y = "% Genes with pN/pS > 1")
+
+# Plot of sliding window results
+p3 <- ggplot(sw_pNpS, aes(x = breakpoint_year, y = metric_diff)) +
+  geom_line() +
+  geom_point() +
+  geom_text(aes(label = sprintf("p=%.3f", p_value)), vjust = -1) +
+  theme_minimal() +
+  labs(title = "Change in pN/pS Ratio Across Different Breakpoints",
+       x = "Breakpoint Year", y = "Difference in Mean pN/pS")
+
+p4 <- ggplot(sw_pos_sel, aes(x = breakpoint_year, y = metric_diff)) +
+  geom_line() +
+  geom_point() +
+  geom_text(aes(label = sprintf("p=%.3f", p_value)), vjust = -1) +
+  theme_minimal() +
+  labs(title = "Change in Positive Selection % Across Different Breakpoints",
+       x = "Breakpoint Year", y = "Difference in % Positive Selection")
+
+plot_grid(p1, p2, p3, p4, ncol = 2)
+
+# 5. FUNCTIONAL ANALYSIS OF GENES WITH LARGEST SELECTION SHIFTS
+# Join the genes with largest shifts with their functional annotations
+top_shifted_genes <- head(gene_selection_shift, 30)
+functional_shifts <- left_join(top_shifted_genes, 
+                               all_emapper %>% select(V1, V8, V9, V11, V12), 
+                               by = c("contig_gene" = "V1"))
+
+# Summarize gene functional categories showing the largest selection shifts
+```
+
+
+
+### INF REMOVED
+
+
+```{r}
+
+all_year_processed <- all_year[all_year$pNpS_ratio != "Inf", ] 
+all_year_processed$pNpS_ratio <- as.numeric(all_year_processed$pNpS_ratio)
+all_year_processed$num_snps <- as.numeric(all_year_processed$num_snps)
+
+# Fi# Prepare annual summary statistics
+annual_diversity <- all_year_processed %>%
+  filter(snps_present == "TRUE") %>%
+  group_by(Collection.Year) %>%
+  summarize(
+    mean_pNpS = mean(pNpS_ratio, na.rm = TRUE),
+    median_pNpS = median(pNpS_ratio, na.rm = TRUE),
+    positive_selection_percent = 100 * sum(pNpS_ratio > 1, na.rm = TRUE) / n(),
+    num_genes_with_snps = n_distinct(contig_gene),
+    mean_snp_density = mean(num_snps, na.rm = TRUE),
+    n_samples = n_distinct(sampleid)
+  ) %>%
+  filter(!is.na(Collection.Year), Collection.Year >= 2000, Collection.Year <= 2018)
+
+
+# Apply PELT changepoint detection to mean pN/pS ratio
+cp_pNpS <- cpt.mean(annual_diversity$mean_pNpS, method = "PELT", 
+                    penalty = "BIC", minseglen = 2)
+cp_years_pNpS <- annual_diversity$Collection.Year[cpts(cp_pNpS)]
+
+# Apply PELT to positive selection percentage
+cp_pos_sel <- cpt.mean(annual_diversity$positive_selection_percent, method = "PELT", 
+                       penalty = "BIC", minseglen = 2)
+cp_years_pos_sel <- annual_diversity$Collection.Year[cpts(cp_pos_sel)]
+
+# Apply PELT to SNP density
+cp_snp <- cpt.mean(annual_diversity$mean_snp_density, method = "PELT", 
+                  penalty = "BIC", minseglen = 2)
+cp_years_snp <- annual_diversity$Collection.Year[cpts(cp_snp)]
+
+sliding_window_test <- function(data, start_year=2006, end_year=2012, metric="mean_pNpS") {
+  results <- data.frame(
+    breakpoint_year = start_year:end_year,
+    metric_diff = numeric(end_year - start_year + 1),
+    p_value = numeric(end_year - start_year + 1)
+  )
+  
+  for(i in 1:nrow(results)) {
+    year <- results$breakpoint_year[i]
+    
+    # Create before/after datasets for this breakpoint
+    before_data <- data[data$Collection.Year <= year, ]
+    after_data <- data[data$Collection.Year > year, ]
+    
+    # Skip if not enough data in either period
+    if(nrow(before_data) < 3 || nrow(after_data) < 3) {
+      results$metric_diff[i] <- NA
+      results$p_value[i] <- NA
+      next
+    }
+    
+    # Calculate actual difference between periods
+    before_val <- mean(before_data[[metric]], na.rm = TRUE)
+    after_val <- mean(after_data[[metric]], na.rm = TRUE)
+    diff <- after_val - before_val
+    results$metric_diff[i] <- diff
+    
+    # Permutation test
+    combined <- rbind(before_data, after_data)
+    combined$period <- c(rep("before", nrow(before_data)), rep("after", nrow(after_data)))
+    
+    perm_diffs <- numeric(1000)
+    for(j in 1:1000) {
+      # Randomly reassign periods
+      set.seed(j)
+      combined$rand_period <- sample(combined$period)
+      
+      # FIX: Properly subset data and access the metric column by name
+      rand_before <- combined[combined$rand_period == "before", ]
+      rand_after <- combined[combined$rand_period == "after", ]
+      
+      # Calculate means for the randomly assigned groups
+      perm_before <- mean(rand_before[[metric]], na.rm = TRUE)
+      perm_after <- mean(rand_after[[metric]], na.rm = TRUE)
+      perm_diffs[j] <- perm_after - perm_before
+    }
+    
+    # Two-sided p-value
+    p_val <- sum(abs(perm_diffs) >= abs(diff)) / 1000
+    results$p_value[i] <- p_val
+  }
+  
+  return(results)
+}
+
+# Run sliding window analysis for different metrics
+sw_pNpS <- sliding_window_test(annual_diversity, metric="mean_pNpS")
+sw_pos_sel <- sliding_window_test(annual_diversity, metric="positive_selection_percent")
+sw_snp_density <- sliding_window_test(annual_diversity, metric="mean_snp_density")
+
+# 3. GENE-SPECIFIC ANALYSIS
+# Get top genes showing the largest selection shift
+gene_selection_shift <- all_year_processed %>%
+  filter(snps_present == "TRUE") %>%
+  group_by(contig_gene, infection_status) %>%
+  summarize(mean_pNpS = mean(pNpS_ratio, na.rm = TRUE), 
+            n_samples = n_distinct(sampleid),
+            .groups = "drop") %>%
+  pivot_wider(id_cols = contig_gene, 
+              names_from = infection_status, 
+              values_from = mean_pNpS) %>%
+  mutate(pNpS_shift = `Post-SWF (2010-2018)` - `Pre-Invasion (2009 and Earlier)`) %>%
+  arrange(desc(abs(pNpS_shift))) %>%
+  filter(!is.na(pNpS_shift))
+
+# 4. VISUALIZATION
+
+p1 <- ggplot(annual_diversity, aes(x = Collection.Year, y = mean_pNpS)) +
+  geom_line() +
+  geom_point() +
+  geom_vline(xintercept = 2009, linetype = "dashed", color = "red") +
+  geom_vline(xintercept = cp_years_pNpS, linetype = "dotted", color = "blue") +
+  theme_minimal(base_size=14) +
+  labs(title = "Mean pN/pS Ratio Over Time",
+       subtitle = "Red = Spiny Water Flea Detection (2009), Blue = Change Points",
+       x = "Year", y = "Mean pN/pS Ratio")
+
+p2 <- ggplot(annual_diversity, aes(x = Collection.Year, y = positive_selection_percent)) +
+  geom_line() +
+  geom_point() +
+  geom_vline(xintercept = 2009, linetype = "dashed", color = "red") +
+  geom_vline(xintercept = cp_years_pos_sel, linetype = "dotted", color = "blue") +
+  theme_minimal(base_size=14) +
+  labs(title = "Percentage of Genes Under Positive Selection",
+       x = "Year", y = "% Genes with pN/pS > 1")
+
+# Plot of sliding window results
+p3 <- ggplot(sw_pNpS, aes(x = breakpoint_year, y = metric_diff)) +
+  geom_line() +
+  geom_point() +
+  geom_text(aes(label = sprintf("p=%.3f", p_value)), vjust = -1) +
+  theme_minimal(base_size=14) +
+  labs(title = "Change in pN/pS Ratio Across Different Breakpoints",
+       x = "Breakpoint Year", y = "Difference in Mean pN/pS")
+
+p4 <- ggplot(sw_pos_sel, aes(x = breakpoint_year, y = metric_diff)) +
+  geom_line() +
+  geom_point() +
+  geom_text(aes(label = sprintf("p=%.3f", p_value)), vjust = -1) +
+  theme_minimal(base_size=14) +
+  labs(title = "Change in Positive Selection % Across Different Breakpoints",
+       x = "Breakpoint Year", y = "Difference in % Positive Selection")
+
+all_p <- grid.arrange(p1, p2, p3, p4, ncol = 2)
+ggsave("changepoint_breakpoint_snps.png", all_p,  width =14, height =12)
+
+
+# 5. FUNCTIONAL ANALYSIS OF GENES WITH LARGEST SELECTION SHIFTS
+# Join the genes with largest shifts with their functional annotations
+top_shifted_genes <- head(gene_selection_shift, 30)
+functional_shifts <- left_join(top_shifted_genes, 
+                               all_emapper %>% select(V1, V8, V9, V11, V12), 
+                               by = c("contig_gene" = "V1"))
+
+# Summarize gene functional categories showing the largest selection shifts
+```
+
+
+
+## looking at obsn 
+
+```{r}
+
+
+all_year_processed <- all_year 
+all_year_processed$pNpS_ratio <- as.numeric(all_year_processed$pNpS_ratio)
+all_year_processed$num_snps <- as.numeric(all_year_processed$num_snps)
+all_year_processed$obsN <- as.numeric(all_year_processed$obsN)
+all_year_processed$obsS <- as.numeric(all_year_processed$obsS)
+
+
+
+
+
+# Fi# Prepare annual summary statistics
+annual_diversity <- all_year_processed %>%
+  filter(snps_present == "TRUE") %>%
+  group_by(Collection.Year) %>%
+  summarize(
+    median_pNpS = median(pNpS_ratio, na.rm = TRUE),
+    positive_selection_percent = 100 * sum(pNpS_ratio > 1, na.rm = TRUE) / n(),
+    num_genes_with_snps = n_distinct(contig_gene),
+    mean_snp_density = mean(num_snps, na.rm = TRUE),
+    mean_obs_n = mean(obsN, na.rm = TRUE),
+    mean_obs_s = mean(obsS, na.rm = TRUE),
+    n_samples = n_distinct(sampleid)
+  ) %>%
+  filter(!is.na(Collection.Year), Collection.Year >= 2000, Collection.Year <= 2018)
+
+# Apply PELT to positive selection percentage
+cp_pos_sel <- cpt.mean(annual_diversity$positive_selection_percent, method = "PELT", 
+                       penalty = "BIC", minseglen = 2)
+cp_years_pos_sel <- annual_diversity$Collection.Year[cpts(cp_pos_sel)]
+
+# Apply PELT to SNP density
+cp_snp <- cpt.mean(annual_diversity$mean_snp_density, method = "PELT", 
+                  penalty = "BIC", minseglen = 2)
+cp_years_snp <- annual_diversity$Collection.Year[cpts(cp_snp)]
+
+
+# Apply PELT to obsN density
+cp_obs_n <- cpt.mean(annual_diversity$mean_obs_n, method = "PELT", 
+                  penalty = "BIC", minseglen = 2)
+cp_years_obs_n <- annual_diversity$Collection.Year[cpts(cp_obs_n)]
+
+
+# Apply PELT to obsS density
+cp_obs_s <- cpt.mean(annual_diversity$mean_obs_s, method = "PELT", 
+                  penalty = "BIC", minseglen = 2)
+cp_years_obs_s <- annual_diversity$Collection.Year[cpts(cp_obs_s)]
+
+
+
+
+
+
+
+p1 <- ggplot(annual_diversity, aes(x = Collection.Year, y = positive_selection_percent)) +
+  geom_line() +
+  geom_point() +
+  geom_vline(xintercept = 2009, linetype = "dashed", color = "red") +
+  geom_vline(xintercept = cp_years_pos_sel, linetype = "dotted", color = "blue") +
+  theme_minimal() +
+  labs(title = "Percentage of Genes Under Positive Selection",
+       x = "Year", y = "% Genes with pN/pS > 1")
+
+
+
+p2 <- ggplot(annual_diversity, aes(x = Collection.Year, y = mean_snp_density)) +
+  geom_line() +
+  geom_point() +
+  geom_vline(xintercept = 2009, linetype = "dashed", color = "red") +
+  geom_vline(xintercept = cp_years_pos_sel, linetype = "dotted", color = "blue") +
+  theme_minimal() +
+  labs(title = "Mean SNP Density",
+       x = "Year", y = "SNP Density")
+
+
+p3 <- ggplot(annual_diversity, aes(x = Collection.Year, y = mean_obs_n)) +
+  geom_line() +
+  geom_point() +
+  geom_vline(xintercept = 2009, linetype = "dashed", color = "red") +
+  geom_vline(xintercept = cp_years_pos_sel, linetype = "dotted", color = "blue") +
+  theme_minimal() +
+  labs(title = "Mean Observed Non-synonymous Mutations",
+       x = "Year", y = "Observed Non-synonymous Mutations")
+
+
+
+p4 <- ggplot(annual_diversity, aes(x = Collection.Year, y = mean_obs_s)) +
+  geom_line() +
+  geom_point() +
+  geom_vline(xintercept = 2009, linetype = "dashed", color = "red") +
+  geom_vline(xintercept = cp_years_pos_sel, linetype = "dotted", color = "blue") +
+  theme_minimal() +
+  labs(title = "Mean Observed Synonymous Mutations",
+       x = "Year", y = "Observed Synonymous Mutations")
+
+
+
+
+
+
+
+
+
+# Run sliding window analysis for different metrics
+sw_pos_sel <- sliding_window_test(annual_diversity, metric="positive_selection_percent")
+sw_snp_density <- sliding_window_test(annual_diversity, metric="mean_snp_density")
+sw_obs_n <- sliding_window_test(annual_diversity, metric="mean_obs_n")
+sw_obs_s <- sliding_window_test(annual_diversity, metric="mean_obs_s")
+
+
+
+# Plot of sliding window results
+p1 <- ggplot(sw_pos_sel, aes(x = breakpoint_year, y = metric_diff)) +
+  geom_line() +
+  geom_point() +
+  geom_text(aes(label = sprintf("p=%.3f", p_value), 
+                color = p_value < 0.05), vjust = -1) +
+  scale_color_manual(values = c("FALSE" = "black", "TRUE" = "red")) +
+  theme_minimal() +
+  guides(color = "none") +  # Hide the legend
+  labs(title = "Change in Positive Selection % Across Different Breakpoints",
+       x = "Breakpoint Year", y = "Difference in % Positive Selection")
+
+p2 <- ggplot(sw_snp_density, aes(x = breakpoint_year, y = metric_diff)) +
+  geom_line() +
+  geom_point() +
+  geom_text(aes(label = sprintf("p=%.3f", p_value), 
+                color = p_value < 0.05), vjust = -1) +
+  scale_color_manual(values = c("FALSE" = "black", "TRUE" = "red")) +
+  theme_minimal() +
+  guides(color = "none") +
+  labs(title = "Change in SNP Density Across Different Breakpoints",
+       x = "Breakpoint Year", y = "Difference in Mean SNP Density")
+
+p3 <- ggplot(sw_obs_n, aes(x = breakpoint_year, y = metric_diff)) +
+  geom_line() +
+  geom_point() +
+  geom_text(aes(label = sprintf("p=%.3f", p_value), 
+                color = p_value < 0.05), vjust = -1) +
+  scale_color_manual(values = c("FALSE" = "black", "TRUE" = "red")) +
+  theme_minimal() +
+  guides(color = "none") +
+  labs(title = "Change in Observed Non-synonymous Mutations Across Different Breakpoints",
+       x = "Breakpoint Year", y = "Difference in Mean Observed Non-synonymous Mutation")
+
+p4 <- ggplot(sw_obs_s, aes(x = breakpoint_year, y = metric_diff)) +
+  geom_line() +
+  geom_point() +
+  geom_text(aes(label = sprintf("p=%.3f", p_value), 
+                color = p_value < 0.05), vjust = -1) +
+  scale_color_manual(values = c("FALSE" = "black", "TRUE" = "red")) +
+  theme_minimal() +
+  guides(color = "none") +
+  labs(title = "Change in Observed Synonymous Mutations Across Different Breakpoints",
+       x = "Breakpoint Year", y = "Difference in Mean Observed Synonymous Mutation")
+
+plot_grid(p1, p2, p3, p4, ncol = 2)
+
+
+```
+
+
+
+
+
+# GLMM
+
+
+
+## YEAR
+
+### year sampling
+```{r}
+
+
+sampling_effort_season <- collection_df %>% group_by(Collection.Year)%>% summarize(sampling=n())
+sampling_effort_season$Collection.Year <- as.character(sampling_effort_season$Collection.Year)
+
+
+
+counts_df <- all_year  %>%
+  group_by(giantvirus,Collection.Year, family, infection_status) %>%
+  summarize(gene_count = n(), gene_count_withsnps =sum(snps_present == "TRUE"),sum_snps = sum(as.numeric(num_snps)),
+            sum_obsn = sum(as.numeric(obsN)),sum_obss = sum(as.numeric(obsS)), .groups = "drop")
+counts_df <- left_join(counts_df, sampling_effort_season, by = c("Collection.Year"))
+counts_df$Collection.Year <- relevel(factor(counts_df$Collection.Year), ref = "2002")
+
+model <- glmmTMB(
+  sum_snps~ Collection.Year  + offset(log(sampling)) + 
+    (1 | family) + (1 | giantvirus),
+  family = nbinom2,
+  data = counts_df
+)
+summary(model)
+
+simulationOutput <- simulateResiduals(fittedModel = model)
+plot(simulationOutput)
+
+```
+
+### year - positive sampling
+```{r}
+
+
+sampling_effort_season <- collection_df %>% group_by(Collection.Year)%>% summarize(sampling=n())
+sampling_effort_season$Collection.Year <- as.character(sampling_effort_season$Collection.Year)
+
+
+
+counts_df <- all_year  %>%
+  group_by(giantvirus,Collection.Year, family, infection_status) %>%
+  summarize(gene_count = n(), gene_count_withsnps =sum(snps_present == "TRUE"),sum_snps = sum(as.numeric(num_snps)),
+            sum_obsn = sum(as.numeric(obsN)),sum_obss = sum(as.numeric(obsS)),
+            positive_gene_count=sum(selection == "Positive"),
+             negative_gene_count=sum(selection == "Negative/Neutral"),
+            .groups = "drop")
+counts_df <- left_join(counts_df, sampling_effort_season, by = c("Collection.Year"))
+counts_df$Collection.Year <- relevel(factor(counts_df$Collection.Year), ref = "2002")
+
+model <- glmmTMB(
+  positive_gene_count ~   Collection.Year  + offset(log(sampling)) + 
+    (1 | family) + (1 | giantvirus),
+  family = nbinom2,
+  data = counts_df
+)
+summary(model)
+
+simulationOutput <- simulateResiduals(fittedModel = model)
+plot(simulationOutput)
+
+```
+
+
+### year - negative sampling
+```{r}
+
+
+sampling_effort_season <- collection_df %>% group_by(Collection.Year)%>% summarize(sampling=n())
+sampling_effort_season$Collection.Year <- as.character(sampling_effort_season$Collection.Year)
+
+
+
+counts_df <- all_year  %>%
+  group_by(giantvirus,Collection.Year, family, infection_status) %>%
+  summarize(gene_count = n(), gene_count_withsnps =sum(snps_present == "TRUE"),sum_snps = sum(as.numeric(num_snps)),
+            sum_obsn = sum(as.numeric(obsN)),sum_obss = sum(as.numeric(obsS)),
+            positive_gene_count=sum(selection == "Positive"),
+             negative_gene_count=sum(selection == "Negative/Neutral"),
+            .groups = "drop")
+counts_df <- left_join(counts_df, sampling_effort_season, by = c("Collection.Year"))
+counts_df$Collection.Year <- relevel(factor(counts_df$Collection.Year), ref = "2002")
+
+model <- glmmTMB(
+  negative_gene_count ~   Collection.Year  + offset(log(sampling)) + 
+    (1 | family) + (1 | giantvirus),
+  family = nbinom2,
+  data = counts_df
+)
+summary(model)
+
+simulationOutput <- simulateResiduals(fittedModel = model)
+plot(simulationOutput)
+```
+
+
+### year - sum_obsn
+```{r}
+
+
+
+counts_df <- all_year  %>%
+  group_by(giantvirus,Collection.Year, family, infection_status) %>%
+  summarize(gene_count = n(), gene_count_withsnps =sum(snps_present == "TRUE"),sum_snps = sum(as.numeric(num_snps)),
+            sum_obsn = sum(as.numeric(obsN)),sum_obss = sum(as.numeric(obsS)),
+            positive_gene_count=sum(selection == "Positive"),
+             negative_gene_count=sum(selection == "Negative/Neutral"),
+            .groups = "drop")
+counts_df <- left_join(counts_df, sampling_effort_season, by = c("Collection.Year"))
+counts_df$Collection.Year <- relevel(factor(counts_df$Collection.Year), ref = "2002")
+
+model <- glmmTMB(
+  sum_obsn ~   Collection.Year  + offset(log(sampling)) + 
+    (1 | family) + (1 | giantvirus),
+  family = nbinom2,
+  data = counts_df
+)
+summary(model)
+
+
+
+```
+
+
+### year - sum_obss
+```{r}
+
+counts_df <- all_year  %>%
+  group_by(giantvirus,Collection.Year, family, infection_status) %>%
+  summarize(gene_count = n(), gene_count_withsnps =sum(snps_present == "TRUE"),sum_snps = sum(as.numeric(num_snps)),
+            sum_obsn = sum(as.numeric(obsN)),sum_obss = sum(as.numeric(obsS)),
+            positive_gene_count=sum(selection == "Positive"),
+             negative_gene_count=sum(selection == "Negative/Neutral"),
+            .groups = "drop")
+counts_df <- left_join(counts_df, sampling_effort_season, by = c("Collection.Year"))
+counts_df$Collection.Year <- relevel(factor(counts_df$Collection.Year), ref = "2002")
+
+model <- glmmTMB(
+  sum_obss ~   Collection.Year  + offset(log(sampling)) + 
+    (1 | family) + (1 | giantvirus),
+  family = nbinom2,
+  data = counts_df
+)
+summary(model)
+
+```
+
+
+### year - positive vs negative
+```{r}
+
+counts_df <- all_year  %>%
+  group_by(giantvirus,Collection.Year, family, infection_status) %>%
+  summarize(gene_count_total = n(), gene_count_withsnps =sum(snps_present == "TRUE"),sum_snps = sum(as.numeric(num_snps)),
+            sum_obsn = sum(as.numeric(obsN)),sum_obss = sum(as.numeric(obsS)),
+            positive_gene_count=sum(selection == "Positive"),
+             negative_gene_count=sum(selection == "Negative/Neutral"),
+            .groups = "drop")
+counts_df <- left_join(counts_df, sampling_effort_season, by = c("Collection.Year"))
+counts_df$Collection.Year <- relevel(factor(counts_df$Collection.Year), ref = "2002")
+
+counts_long <- counts_df %>%
+  pivot_longer(cols = c(positive_gene_count, negative_gene_count),
+               names_to = "gene_category",
+               values_to = "gene_count") %>%
+  mutate(gene_category = factor(gene_category, levels = c("positive_gene_count", "negative_gene_count")))
+
+
+model <- glmmTMB(
+  sum_obss ~   Collection.Year  + offset(log(sampling)) + 
+    (1 | family) + (1 | giantvirus),
+  family = nbinom2,
+  data = counts_df
+)
+summary(model)
+
+```
+
+
+
+
+
+## SEASON
+
+### general snp count
+```{r}
+sampling_effort_season <- collection_df %>% group_by(Label)%>% summarize(sampling=n())
+
+
+
+
+counts_df <- all_year  %>%
+  group_by(giantvirus,Label, family) %>%
+  summarize(gene_count_total = n(), gene_count_withsnps =sum(snps_present == "TRUE"),sum_snps = sum(as.numeric(num_snps)),
+            sum_obsn = sum(as.numeric(obsN)),sum_obss = sum(as.numeric(obsS)),
+            positive_gene_count=sum(selection == "Positive"),
+             negative_gene_count=sum(selection == "Negative/Neutral"),
+            .groups = "drop")
+counts_df <- left_join(counts_df, sampling_effort_season, by = c("Label"))
+counts_df$Label <- relevel(factor(counts_df$Label), ref = "Early.Summer")
+
+model <- glmmTMB(
+  sum_snps~ Label  + offset(log(sampling)) + 
+    (1 | family) + (1 | giantvirus),
+  family = nbinom2,
+  data = counts_df
+)
+summary(model)
+```
+
+
+#### positive gene count
+```{r}
+
+counts_df <- all_year  %>%
+  group_by(giantvirus,Label, family) %>%
+  summarize(gene_count_total = n(), gene_count_withsnps =sum(snps_present == "TRUE"),sum_snps = sum(as.numeric(num_snps)),
+            sum_obsn = sum(as.numeric(obsN)),sum_obss = sum(as.numeric(obsS)),
+            positive_gene_count=sum(selection == "Positive"),
+             negative_gene_count=sum(selection == "Negative/Neutral"),
+            .groups = "drop")
+counts_df <- left_join(counts_df, sampling_effort_season, by = c("Label"))
+counts_df$Label <- relevel(factor(counts_df$Label), ref = "Early.Summer")
+
+model <- glmmTMB(
+  positive_gene_count~ Label  + offset(log(sampling)) + 
+    (1 | family) + (1 | giantvirus),
+  family = nbinom2,
+  data = counts_df
+)
+summary(model)
+```
+
+### obsn
+```{r}
+
+counts_df <- all_year  %>%
+  group_by(giantvirus,Label, family) %>%
+  summarize(gene_count_total = n(), gene_count_withsnps =sum(snps_present == "TRUE"),sum_snps = sum(as.numeric(num_snps)),
+            sum_obsn = sum(as.numeric(obsN)),sum_obss = sum(as.numeric(obsS)),
+            positive_gene_count=sum(selection == "Positive"),
+             negative_gene_count=sum(selection == "Negative/Neutral"),
+            .groups = "drop")
+counts_df <- left_join(counts_df, sampling_effort_season, by = c("Label"))
+counts_df$Label <- relevel(factor(counts_df$Label), ref = "Early.Summer")
+
+model <- glmmTMB(
+  sum_obsn~ Label  + offset(log(sampling)) + 
+    (1 | family) + (1 | giantvirus),
+  family = nbinom2,
+  data = counts_df
+)
+summary(model)
+```
+#### positive gene count
+```{r}
+
+counts_df <- all_year  %>%
+  group_by(giantvirus,Label, family) %>%
+  summarize(gene_count_total = n(), gene_count_withsnps =sum(snps_present == "TRUE"),sum_snps = sum(as.numeric(num_snps)),
+            sum_obsn = sum(as.numeric(obsN)),sum_obss = sum(as.numeric(obsS)),
+            positive_gene_count=sum(selection == "Positive"),
+             negative_gene_count=sum(selection == "Negative/Neutral"),
+            .groups = "drop")
+counts_df <- left_join(counts_df, sampling_effort_season, by = c("Label"))
+counts_df$Label <- relevel(factor(counts_df$Label), ref = "Early.Summer")
+
+model <- glmmTMB(
+  negative_gene_count~ Label  + offset(log(sampling)) + 
+    (1 | family) + (1 | giantvirus),
+  family = nbinom2,
+  data = counts_df
+)
+summary(model)
+```
+
+### obss
+```{r}
+
+counts_df <- all_year  %>%
+  group_by(giantvirus,Label, family) %>%
+  summarize(gene_count_total = n(), gene_count_withsnps =sum(snps_present == "TRUE"),sum_snps = sum(as.numeric(num_snps)),
+            sum_obsn = sum(as.numeric(obsN)),sum_obss = sum(as.numeric(obsS)),
+            positive_gene_count=sum(selection == "Positive"),
+             negative_gene_count=sum(selection == "Negative/Neutral"),
+            .groups = "drop")
+counts_df <- left_join(counts_df, sampling_effort_season, by = c("Label"))
+counts_df$Label <- relevel(factor(counts_df$Label), ref = "Early.Summer")
+
+model <- glmmTMB(
+  sum_obss~ Label  + offset(log(sampling)) + 
+    (1 | family) + (1 | giantvirus),
+  family = nbinom2,
+  data = counts_df
+)
+summary(model)
+```
+
+
+
+## INVASION
+
+### All snp count
+#### glmm
+```{r}
+
+sampling_effort_season <- collection_df %>% group_by(Collection.Year)%>% summarize(sampling=n())
+sampling_effort_season$Collection.Year <- as.character(sampling_effort_season$Collection.Year)
+
+counts_df <- all_year  %>%
+  group_by(giantvirus,Collection.Year, infection_status, family) %>%
+  summarize(gene_count_total = n(), gene_count_withsnps =sum(snps_present == "TRUE"),sum_snps = sum(as.numeric(num_snps)),
+            sum_obsn = sum(as.numeric(obsN)),sum_obss = sum(as.numeric(obsS)),
+            positive_gene_count=sum(selection == "Positive"),
+             negative_gene_count=sum(selection == "Negative/Neutral"),
+            .groups = "drop")
+
+counts_df <- left_join(counts_df, sampling_effort_season, by = c("Collection.Year"))
+
+m1 <- glmmTMB(sum_snps ~ infection_status + offset(log(sampling)) +
+                (1 | family) + (1 | giantvirus),
+              family = nbinom2, data = counts_df)
+summary(m1)
+
+
+m2 <- glmmTMB(sum_snps ~ infection_status + log(sampling) +
+                (1 | family) + (1 | giantvirus),
+              family = nbinom2, data = counts_df)
+summary(m2)
+```
+
+
+
+#### rarefraction
+```{r}
+
+set.seed(123)
+n_pre  <- with(counts_df, min(tapply(sampling,infection_status, sum)))  
+results <- replicate(200, {
+  tmp <- counts_df %>%
+    group_by(infection_status) %>%
+    sample_frac(n_pre / sum(sampling))      
+
+  fit <- glmmTMB(sum_snps ~ infection_status + offset(log(sampling)) +
+                   (1 | family) + (1 | giantvirus),
+                 family = nbinom2, data = tmp)
+  coef_tab <- summary(fit)$coefficients$cond  
+  coef_tab[grep("^infection_status", rownames(coef_tab)), "Estimate"]
+})
+mean(results); quantile(results, c(.025,.975))
+
+
+```
+
+
+
+#### change‑point / segmented regression
+```{r}
+
+library(segmented)
+
+sampling_effort_season <- collection_df %>% group_by(Collection.Year)%>% summarize(sampling=n())
+sampling_effort_season$Collection.Year <- as.character(sampling_effort_season$Collection.Year)
+
+counts_df <- all_year  %>%
+  group_by(giantvirus,Collection.Year, infection_status, family) %>%
+  summarize(gene_count_total = n(), gene_count_withsnps =sum(snps_present == "TRUE"),sum_snps = sum(as.numeric(num_snps)),
+            sum_obsn = sum(as.numeric(obsN)),sum_obss = sum(as.numeric(obsS)),
+            positive_gene_count=sum(selection == "Positive"),
+             negative_gene_count=sum(selection == "Negative/Neutral"),
+            .groups = "drop")
+
+counts_df <- left_join(counts_df, sampling_effort_season, by = c("Collection.Year"))
+counts_df$Collection.Year <- as.numeric(counts_df$Collection.Year)
+
+cuts <- 2003:2014
+aic_vec <- sapply(cuts, function(cut){
+  counts_df$period <- factor(ifelse(counts_df$Collection.Year > cut, "Post", "Pre"))
+  AIC(glmmTMB(sum_snps ~ period + offset(log(sampling)) +
+                (1|family)+(1|giantvirus),
+              family = nbinom2, data = counts_df))
+})
+plot(cuts, aic_vec, type="b"); abline(v = 2009, col="red")
+
+```
+
+### Adding environmental factors
+#### physical & chemical
+
+```{r }
+
+physical <- read_csv("LM_Metadata/Lake Mendota Metadata - Physical Limnology (2).csv")
+chemical <-read_csv("LM_Metadata/Lake Mendota Metadata - Chemical Limnology.csv")
+
+
+env_phys <- physical %>%
+  mutate(Year = year4) %>%           
+  group_by(Year) %>%
+  summarise(across(where(is.numeric), mean, na.rm = TRUE), .groups = "drop")
+
+env_chem <- chemical %>%
+  mutate(Year = year4) %>%
+  group_by(Year) %>%
+  summarise(across(where(is.numeric), mean, na.rm = TRUE), .groups = "drop")
+
+
+env_all <- Reduce(function(x, y) full_join(x, y, by = "Year"),
+                  list(env_phys, env_chem))
+
+
+counts_df <- all_year  %>%
+  group_by(giantvirus,Collection.Year, infection_status, family) %>%
+  summarize(gene_count_total = n(), gene_count_withsnps =sum(snps_present == "TRUE"),sum_snps = sum(as.numeric(num_snps)),
+            sum_obsn = sum(as.numeric(obsN)),sum_obss = sum(as.numeric(obsS)),
+            positive_gene_count=sum(selection == "Positive"),
+             negative_gene_count=sum(selection == "Negative/Neutral"),
+            .groups = "drop")
+
+counts_df <- left_join(counts_df, sampling_effort_season, by = c("Collection.Year"))
+counts_df$Collection.Year <- as.numeric(counts_df$Collection.Year)
+
+counts_env <- counts_df %>%
+  mutate(Year = as.integer(as.character(Collection.Year))) %>%     # make numeric
+  left_join(env_all, by = "Year")
+
+
+
+full_mod <- glmmTMB(
+  sum_snps ~ infection_status + water_temp + dissolved_oxygen + oxygen_sat_pct + dissolved_inorganic_carbon + total_ino_carb + dissolved_organic_carbon +total_org_car+
+             offset(log(sampling)) +
+             (1 | family) + (1 | giantvirus),
+  family = nbinom2,
+  data = counts_env
+)
+
+summary(full_mod)
+
+```
+
+
+### Positive SNPs
+### glmm
+```{r}
+
+sampling_effort_season <- collection_df %>% group_by(Collection.Year)%>% summarize(sampling=n())
+sampling_effort_season$Collection.Year <- as.character(sampling_effort_season$Collection.Year)
+
+counts_df <- all_year  %>%
+  group_by(giantvirus,Collection.Year, infection_status, family) %>%
+  summarize(gene_count_total = n(), gene_count_withsnps =sum(snps_present == "TRUE"),sum_snps = sum(as.numeric(num_snps)),
+            sum_obsn = sum(as.numeric(obsN)),sum_obss = sum(as.numeric(obsS)),
+            positive_gene_count=sum(selection == "Positive"),
+             negative_gene_count=sum(selection == "Negative/Neutral"),
+            .groups = "drop")
+
+counts_df <- left_join(counts_df, sampling_effort_season, by = c("Collection.Year"))
+
+m1 <- glmmTMB(positive_gene_count ~ infection_status + offset(log(sampling)) +
+                (1 | family) + (1 | giantvirus),
+              family = nbinom2, data = counts_df)
+summary(m1)
+
+
+m2 <- glmmTMB(positive_gene_count ~ infection_status + log(sampling) +
+                (1 | family) + (1 | giantvirus),
+              family = nbinom2, data = counts_df)
+summary(m2)
+```
+
+
+
+### rarefraction
+```{r}
+
+set.seed(123)
+n_pre  <- with(counts_df, min(tapply(sampling,infection_status, sum)))  
+results <- replicate(200, {
+  tmp <- counts_df %>%
+    group_by(infection_status) %>%
+    sample_frac(n_pre / sum(sampling))      
+
+  fit <- glmmTMB(positive_gene_count ~ infection_status + offset(log(sampling)) +
+                   (1 | family) + (1 | giantvirus),
+                 family = nbinom2, data = tmp)
+  coef_tab <- summary(fit)$coefficients$cond  
+  coef_tab[grep("^infection_status", rownames(coef_tab)), "Estimate"]
+})
+mean(results); quantile(results, c(.025,.975))
+
+
+```
+
+
+
+### change‑point / segmented regression
+```{r}
+
+library(segmented)
+
+sampling_effort_season <- collection_df %>% group_by(Collection.Year)%>% summarize(sampling=n())
+sampling_effort_season$Collection.Year <- as.character(sampling_effort_season$Collection.Year)
+
+counts_df <- all_year  %>%
+  group_by(giantvirus,Collection.Year, infection_status, family) %>%
+  summarize(gene_count_total = n(), gene_count_withsnps =sum(snps_present == "TRUE"),positive_gene_count = sum(as.numeric(num_snps)),
+            sum_obsn = sum(as.numeric(obsN)),sum_obss = sum(as.numeric(obsS)),
+            positive_gene_count=sum(selection == "Positive"),
+             negative_gene_count=sum(selection == "Negative/Neutral"),
+            .groups = "drop")
+
+counts_df <- left_join(counts_df, sampling_effort_season, by = c("Collection.Year"))
+counts_df$Collection.Year <- as.numeric(counts_df$Collection.Year)
+
+cuts <- 2003:2014
+aic_vec <- sapply(cuts, function(cut){
+  counts_df$period <- factor(ifelse(counts_df$Collection.Year > cut, "Post", "Pre"))
+  AIC(glmmTMB(positive_gene_count ~ period + offset(log(sampling)) +
+                (1|family)+(1|giantvirus),
+              family = nbinom2, data = counts_df))
+})
+plot(cuts, aic_vec, type="b"); abline(v = 2009, col="red")
+
+```
+
+# Adding environmental factors
+## physical & chemical
+
+```{r }
+
+physical <- read_csv("LM_Metadata/Lake Mendota Metadata - Physical Limnology (2).csv")
+chemical <-read_csv("LM_Metadata/Lake Mendota Metadata - Chemical Limnology.csv")
+
+
+env_phys <- physical %>%
+  mutate(Year = year4) %>%           
+  group_by(Year) %>%
+  summarise(across(where(is.numeric), mean, na.rm = TRUE), .groups = "drop")
+
+env_chem <- chemical %>%
+  mutate(Year = year4) %>%
+  group_by(Year) %>%
+  summarise(across(where(is.numeric), mean, na.rm = TRUE), .groups = "drop")
+
+
+env_all <- Reduce(function(x, y) full_join(x, y, by = "Year"),
+                  list(env_phys, env_chem))
+
+
+counts_df <- all_year  %>%
+  group_by(giantvirus,Collection.Year, infection_status, family) %>%
+  summarize(gene_count_total = n(), gene_count_withsnps =sum(snps_present == "TRUE"),sum_snps = sum(as.numeric(num_snps)),
+            sum_obsn = sum(as.numeric(obsN)),sum_obss = sum(as.numeric(obsS)),
+            positive_gene_count=sum(selection == "Positive"),
+             negative_gene_count=sum(selection == "Negative/Neutral"),
+            .groups = "drop")
+
+counts_df <- left_join(counts_df, sampling_effort_season, by = c("Collection.Year"))
+counts_df$Collection.Year <- as.numeric(counts_df$Collection.Year)
+
+counts_env <- counts_df %>%
+  mutate(Year = as.integer(as.character(Collection.Year))) %>%     # make numeric
+  left_join(env_all, by = "Year")
+
+
+
+full_mod <- glmmTMB(
+  positive_gene_count ~ infection_status + water_temp + dissolved_oxygen + oxygen_sat_pct + dissolved_inorganic_carbon + total_ino_carb + dissolved_organic_carbon +total_org_car+
+             offset(log(sampling)) +
+             (1 | family) + (1 | giantvirus),
+  family = nbinom2,
+  data = counts_env
+)
+
+summary(full_mod)
+
+```
+
+
+
+
+
+#with network
+
+```{r }
+library(dplyr)
+
+edgelist <- read.table("R_studio/final_codes/Files/flashweave_results/forflashweave_euk_ncldv_transformed_data.edgelist", header = FALSE, stringsAsFactors = FALSE)
+filtered_data <-edgelist%>%
+  mutate(first_three_col1 = substr(V1, 1, 3),
+         first_three_col2 = substr(V2, 1, 3)) %>%
+  filter(first_three_col1 != first_three_col2) %>%
+  dplyr::select(-first_three_col1, -first_three_col2)
+filtered_data2 <- filtered_data[filtered_data$V3 >= 0,]
+colnames(filtered_data2) <- c('Link1','Link2','edge') 
+temp <- fread("img_for_yumary.18S.abundances.tsv", sep = "\t")
+host_tax <- temp[,c(1,3,5,6,7,8)]
+host_tax$sequence_name  <- gsub("33000", "IMG33000", host_tax$sequence_name )
+host_tax$sequence_name  <- gsub(".a", "", host_tax$sequence_name )
+filtered_data2$Link1  <- gsub("Ga", "", filtered_data2$Link1  )
+host_edge <- left_join(filtered_data2, host_tax, by=c("Link1"="sequence_name"))
+
+temp <- fread("R_studio/final_codes/Files/polb_new_tax.csv", header=FALSE)
+colnames(temp) <- c("V1","Family")
+host_ncldv_edge <- left_join(host_edge, temp, by=c("Link2"="V1"))
+temp <- fread("R_studio/text_files_host/img_spid_mapping_mendota.txt", sep = " ")
+host_ncldv_edge$taxon_oid <- as.character(host_ncldv_edge$taxon_oid)
+temp$V2 <- as.character(temp$V2)
+host_ncldv_edge2 <- left_join(host_ncldv_edge,temp, by=c("taxon_oid"="V2"))
+collection_df$Sequencing.Project.ID <- as.character(collection_df$Sequencing.Project.ID)
+host_ncldv_edge2$V1 <- as.character(host_ncldv_edge2$V1)
+host_ncldv_edge3 <- left_join(host_ncldv_edge2,collection_df, by=c("V1"="Sequencing.Project.ID"))
+
+
+host_ncldv_edge3_new <-drop_na(host_ncldv_edge3)
+
+
+host_ncldv_edge_2009before <- host_ncldv_edge3[host_ncldv_edge3$Collection.Year <= 2009, ]
+host_ncldv_edge_2010after <- host_ncldv_edge3[host_ncldv_edge3$Collection.Year > 2009, ]
+host_ncldv_edge_2009before <- drop_na(host_ncldv_edge_2009before)
+host_ncldv_edge_2010after <-drop_na(host_ncldv_edge_2010after)
+max_edge_host_ncldv2009before <- host_ncldv_edge_2009before %>% group_by(subdivision,Family) %>% summarize(max_edge = max(edge))
+max_edge_host_ncldv2010after <- host_ncldv_edge_2010after %>% group_by(subdivision,Family) %>% summarize(max_edge = max(edge))
+colnames(max_edge_host_ncldv2010after) <- c('Link1','Link2','edge') 
+colnames(max_edge_host_ncldv2009before) <- c('Link1','Link2','edge') 
+
+incidence_mat <- function(edge_df){
+  bin_df <- edge_df %>%
+    filter(edge > 0) %>%                      
+    distinct(Link2, Link1) %>%              
+    mutate(value = 1L)                       
+  mat <- bin_df %>%
+    pivot_wider(names_from  = Link1,
+                values_from = value,
+                values_fill = list(value = 0)) %>%  
+    column_to_rownames("Link2") %>%      
+    as.matrix()
+
+  mat
+}
+M_pre  <- incidence_mat(max_edge_host_ncldv2009before)
+M_post <- incidence_mat(max_edge_host_ncldv2010after)
+
+
+
+
+
+
+library(bipartite)
+nested_pre  <- networklevel(M_pre,  index = "nestedness")
+nested_post <- networklevel(M_post, index = "nestedness")
+H2_pre  <- networklevel(M_pre,  index = "H2")
+H2_post <- networklevel(M_post, index = "H2")
+mod_pre  <- computeModules(M_pre)
+mod_post <- computeModules(M_post)
+Q_pre    <- slot(mod_pre,  "likelihood")   
+Q_post   <- slot(mod_post, "likelihood")
+deg_pre  <- specieslevel(M_pre,  index = "degree")
+deg_post <- specieslevel(M_post, index = "degree")
+breadth_pre  <- deg_pre$`lower level` %>%         
+  as.data.frame() %>%                          
+  tibble::rownames_to_column("virus") %>%      
+  dplyr::select(virus, k_pre = degree)       
+breadth_post <- deg_post$`lower level` %>%
+  as.data.frame() %>%                          
+  tibble::rownames_to_column("virus") %>%      
+  dplyr::select(virus, k_pre = degree) 
+
+
+get_mod <- function(mod_obj){
+  data.frame(virus  = rownames(mod_obj@modules),
+             module = mod_obj@modules$c)      
+}
+mod_df_pre  <- get_mod(mod_pre)
+mod_df_post <- get_mod(mod_post)
+
+# Merge
+mods <- full_join(mod_df_pre,  mod_df_post,
+                  by = "virus", suffix = c("_pre","_post"))
+mods <- mods %>%
+        mutate(jump = module_pre != module_post)  # TRUE = module change
+
+
+analysis_df <- mods %>%
+  left_join(breadth_pre,  by = "virus") %>%
+  left_join(breadth_post, by = "virus") %>%
+  left_join(sel_df,       by = "virus") %>%
+  mutate(delta_k = k_post - k_pre,
+         gained_hosts = delta_k > 0)
+
+
+t.test(n_pos_genes ~ jump, data = analysis_df)           # simple
+
+# GLM controlling for family & sequencing depth
+library(glmmTMB)
+m1 <- glmmTMB(n_pos_genes ~ jump + offset(log(total_genes)) +
+              (1|family),
+              family = nbinom2, data = analysis_df)
+summary(m1)
+
+
+analysis_df <- analysis_df %>%
+  mutate(prop_pos = n_pos_genes / total_genes)
+
+cor.test(analysis_df$delta_k, analysis_df$prop_pos, method = "spearman")
+
+
+library(ggplot2)
+ggplot(analysis_df,
+       aes(x = delta_k, y = prop_pos, colour = jump)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm", se = FALSE) +
+  theme_bw() +
+  labs(x = "Change in host breadth (post – pre)",
+       y = "Proportion of genes under positive selection")
+
+
+```
+
+
+
+
+
+
